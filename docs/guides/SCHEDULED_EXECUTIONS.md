@@ -107,7 +107,39 @@ Pragmas (`journal_mode=WAL`, `busy_timeout=5000`, `synchronous=NORMAL`, `foreign
 - **Multi-instance deployments** must share the database (or use a future networked backend) so that any daemon can see schedules another created.
 - **Time zones** — every timestamp is stored as UTC unix seconds. RFC3339 inputs with offsets are converted to UTC at parse time.
 
+## CLI usage
+
+The `faramesh schedule` subcommand talks to the daemon over the authenticated SDK socket. All operations require an admin token, sourced in this order:
+
+1. `--admin-token <secret>` flag.
+2. `FARAMESH_STANDING_ADMIN_TOKEN` environment variable.
+3. `FARAMESH_POLICY_ADMIN_TOKEN` environment variable.
+
+Without a configured admin token on the daemon (`--standing-admin-token` / `--policy-admin-token`), every `faramesh schedule` call fails closed with `control_admin_unconfigured`.
+
+```bash
+export FARAMESH_STANDING_ADMIN_TOKEN=<secret>
+
+# Schedule a payment for execution in 30 minutes, with policy reeval at exec time.
+faramesh schedule create \
+  --tool stripe/refund --agent payment-bot \
+  --args '{"amount":500,"customer":"cust_abc"}' \
+  --at "+30m" --reeval
+
+# List, inspect, walk pending approvals, approve, see history.
+faramesh schedule list --agent payment-bot
+faramesh schedule inspect sched_<...>
+faramesh schedule pending
+faramesh schedule approve sched_<...> --by ops-team
+faramesh schedule history --window 24h
+
+# Cancel before it runs.
+faramesh schedule cancel sched_<...>
+```
+
+If the SDK socket is unreachable and `--http-fallback --addr <daemon-http>` is set, the CLI falls back to the equivalent `/api/v1/schedule/*` HTTP route. By default the SDK socket is the only path.
+
 ## See also
 
-- `cmd/faramesh/schedule.go` — the CLI surface backed by this package (transport added in the follow-on PR).
+- `cmd/faramesh/schedule.go` — the CLI surface backed by this package.
 - `docs/guides/DELEGATION_GRANTS.md` — sibling persistence layer using the same SQLite + migration pattern.

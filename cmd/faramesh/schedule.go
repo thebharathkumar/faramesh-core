@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -13,12 +15,13 @@ var scheduleCmd = &cobra.Command{
 }
 
 var (
-	schedCreateTool   string
-	schedCreateArgs   string
-	schedCreateAgent  string
-	schedCreateAt     string
-	schedCreatePolicy string
-	schedCreateReeval bool
+	schedCreateTool    string
+	schedCreateArgs    string
+	schedCreateAgent   string
+	schedCreateAt      string
+	schedCreatePolicy  string
+	schedCreateReeval  bool
+	scheduleAdminToken string
 )
 
 var scheduleCreateCmd = &cobra.Command{
@@ -36,6 +39,10 @@ var scheduleListCmd = &cobra.Command{
 	Args:  cobra.NoArgs,
 	RunE:  runScheduleList,
 }
+
+var (
+	scheduleApproveBy string
+)
 
 var scheduleInspectCmd = &cobra.Command{
 	Use:   "inspect <schedule-id>",
@@ -78,15 +85,18 @@ func init() {
 	scheduleCreateCmd.Flags().StringVar(&schedCreateTool, "tool", "", "tool identifier to schedule")
 	scheduleCreateCmd.Flags().StringVar(&schedCreateArgs, "args", "", "tool arguments as JSON object")
 	scheduleCreateCmd.Flags().StringVar(&schedCreateAgent, "agent", "", "agent identifier")
-	scheduleCreateCmd.Flags().StringVar(&schedCreateAt, "at", "", "execution time (RFC3339 or relative, e.g. +30m)")
+	scheduleCreateCmd.Flags().StringVar(&schedCreateAt, "at", "", "execution time (RFC3339 or relative, e.g. +30m, +2d3h)")
 	scheduleCreateCmd.Flags().StringVar(&schedCreatePolicy, "policy", "", "policy to evaluate against")
 	scheduleCreateCmd.Flags().BoolVar(&schedCreateReeval, "reeval", false, "re-evaluate policy at execution time")
 	_ = scheduleCreateCmd.MarkFlagRequired("tool")
 	_ = scheduleCreateCmd.MarkFlagRequired("agent")
 
 	scheduleListCmd.Flags().StringVar(&schedListAgent, "agent", "", "filter by agent identifier")
-
+	scheduleApproveCmd.Flags().StringVar(&scheduleApproveBy, "by", "", "approver identifier (defaults to $USER)")
 	scheduleHistoryCmd.Flags().StringVar(&schedHistoryWindow, "window", "24h", "time window for history")
+
+	scheduleCmd.PersistentFlags().StringVar(&scheduleAdminToken, "admin-token", "",
+		"daemon admin token (defaults to $FARAMESH_STANDING_ADMIN_TOKEN or $FARAMESH_POLICY_ADMIN_TOKEN)")
 
 	scheduleCmd.AddCommand(
 		scheduleCreateCmd, scheduleListCmd, scheduleInspectCmd,
@@ -94,6 +104,44 @@ func init() {
 		scheduleHistoryCmd,
 	)
 	rootCmd.AddCommand(scheduleCmd)
+}
+
+// resolveScheduleAdminToken picks the admin token from --admin-token,
+// FARAMESH_STANDING_ADMIN_TOKEN, or FARAMESH_POLICY_ADMIN_TOKEN, in that
+// order. Empty result is returned to the daemon, which fails closed.
+func resolveScheduleAdminToken() string {
+	if v := strings.TrimSpace(scheduleAdminToken); v != "" {
+		return v
+	}
+	if v := strings.TrimSpace(os.Getenv("FARAMESH_STANDING_ADMIN_TOKEN")); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv("FARAMESH_POLICY_ADMIN_TOKEN"))
+}
+
+// scheduleSocketRequestWithHTTPFallback sends a "type":"schedule" socket
+// message and falls back to the HTTP /api/v1/schedule/* surface only if
+// --http-fallback is set. Matches the established `compensate`,
+// `credential`, and `delegate` patterns.
+func scheduleSocketRequestWithHTTPFallback(op string, payload map[string]any, httpMethod, httpPath string, httpQuery map[string]string) (json.RawMessage, error) {
+	req := map[string]any{"type": "schedule", "op": op, "admin_token": resolveScheduleAdminToken()}
+	for k, v := range payload {
+		req[k] = v
+	}
+	resp, err := daemonSocketRequest(req)
+	if err == nil {
+		return resp, nil
+	}
+	if !daemonHTTPFallback {
+		return nil, err
+	}
+	if httpMethod == "GET" {
+		if len(httpQuery) > 0 {
+			return daemonGetWithQuery(httpPath, httpQuery)
+		}
+		return daemonGet(httpPath)
+	}
+	return daemonPost(httpPath, payload)
 }
 
 func runScheduleCreate(_ *cobra.Command, _ []string) error {
@@ -109,13 +157,14 @@ func runScheduleCreate(_ *cobra.Command, _ []string) error {
 		body["policy"] = schedCreatePolicy
 	}
 	if schedCreateArgs != "" {
-		var parsed any
-		if err := json.Unmarshal([]byte(schedCreateArgs), &parsed); err != nil {
+		// Validate it's parseable JSON before sending; the daemon stores it as a string.
+		var probe any
+		if err := json.Unmarshal([]byte(schedCreateArgs), &probe); err != nil {
 			return fmt.Errorf("--args must be valid JSON: %w", err)
 		}
-		body["args"] = parsed
+		body["args"] = schedCreateArgs
 	}
-	resp, err := daemonPost("/api/v1/schedule/create", body)
+	resp, err := scheduleSocketRequestWithHTTPFallback("create", body, "POST", "/api/v1/schedule/create", nil)
 	if err != nil {
 		return err
 	}
@@ -124,9 +173,13 @@ func runScheduleCreate(_ *cobra.Command, _ []string) error {
 }
 
 func runScheduleList(_ *cobra.Command, _ []string) error {
-	resp, err := daemonGetWithQuery("/api/v1/schedule/list", map[string]string{
-		"agent": schedListAgent,
-	})
+	body := map[string]any{}
+	q := map[string]string{}
+	if schedListAgent != "" {
+		body["agent_id"] = schedListAgent
+		q["agent"] = schedListAgent
+	}
+	resp, err := scheduleSocketRequestWithHTTPFallback("list", body, "GET", "/api/v1/schedule/list", q)
 	if err != nil {
 		return err
 	}
@@ -135,9 +188,9 @@ func runScheduleList(_ *cobra.Command, _ []string) error {
 }
 
 func runScheduleInspect(_ *cobra.Command, args []string) error {
-	resp, err := daemonGetWithQuery("/api/v1/schedule/inspect", map[string]string{
-		"id": args[0],
-	})
+	resp, err := scheduleSocketRequestWithHTTPFallback("inspect",
+		map[string]any{"id": args[0]},
+		"GET", "/api/v1/schedule/inspect", map[string]string{"id": args[0]})
 	if err != nil {
 		return err
 	}
@@ -146,9 +199,9 @@ func runScheduleInspect(_ *cobra.Command, args []string) error {
 }
 
 func runScheduleCancel(_ *cobra.Command, args []string) error {
-	resp, err := daemonPost("/api/v1/schedule/cancel", map[string]any{
-		"schedule_id": args[0],
-	})
+	resp, err := scheduleSocketRequestWithHTTPFallback("cancel",
+		map[string]any{"schedule_id": args[0]},
+		"POST", "/api/v1/schedule/cancel", nil)
 	if err != nil {
 		return err
 	}
@@ -157,9 +210,13 @@ func runScheduleCancel(_ *cobra.Command, args []string) error {
 }
 
 func runScheduleApprove(_ *cobra.Command, args []string) error {
-	resp, err := daemonPost("/api/v1/schedule/approve", map[string]any{
-		"schedule_id": args[0],
-	})
+	approver := strings.TrimSpace(scheduleApproveBy)
+	if approver == "" {
+		approver = strings.TrimSpace(os.Getenv("USER"))
+	}
+	resp, err := scheduleSocketRequestWithHTTPFallback("approve",
+		map[string]any{"schedule_id": args[0], "approver": approver},
+		"POST", "/api/v1/schedule/approve", nil)
 	if err != nil {
 		return err
 	}
@@ -168,7 +225,9 @@ func runScheduleApprove(_ *cobra.Command, args []string) error {
 }
 
 func runSchedulePending(_ *cobra.Command, _ []string) error {
-	resp, err := daemonGet("/api/v1/schedule/pending")
+	resp, err := scheduleSocketRequestWithHTTPFallback("pending",
+		map[string]any{},
+		"GET", "/api/v1/schedule/pending", nil)
 	if err != nil {
 		return err
 	}
@@ -177,9 +236,9 @@ func runSchedulePending(_ *cobra.Command, _ []string) error {
 }
 
 func runScheduleHistory(_ *cobra.Command, _ []string) error {
-	resp, err := daemonGetWithQuery("/api/v1/schedule/history", map[string]string{
-		"window": schedHistoryWindow,
-	})
+	resp, err := scheduleSocketRequestWithHTTPFallback("history",
+		map[string]any{"window": schedHistoryWindow},
+		"GET", "/api/v1/schedule/history", map[string]string{"window": schedHistoryWindow})
 	if err != nil {
 		return err
 	}
